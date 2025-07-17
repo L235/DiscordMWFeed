@@ -24,12 +24,16 @@ import logging
 import os
 import sys
 import time
+import random
+from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import requests
 import http.cookiejar as cookiejar
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from discord import SyncWebhook, HTTPException
 
 ###############################################################################
@@ -55,6 +59,15 @@ CONFIG = {
     # Discord back-off
     "initial_backoff": 2,            # seconds
     "max_backoff": 120,              # seconds
+
+    # MediaWiki / generic HTTP retry tuning (urllib3.Retry)
+    #
+    # total attempts = total + 1 original request?  In urllib3 semantics,
+    # total counts *retries*, so 5 => up to 6 network calls.  Choose what you like.
+    "http_total_retries": 5,
+    "http_backoff_factor": 1.0,      # sleep = factor * (2 ** (n-1)) after 1st retry
+    # NOTE: Retry will honour Retry-After headers when respect_retry_after_header=True.
+    # We'll retry on both idempotent + POST etc. by disabling allowed_methods filtering.
 }
 
 ###############################################################################
@@ -74,6 +87,92 @@ def save_state(path: Path, rcid: int) -> None:
     path.write_text(str(rcid))
 
 
+###############################################################################
+# requests.Session w/ urllib3.Retry
+###############################################################################
+
+RETRYABLE_STATUS = (408, 425, 429, 500, 502, 503, 504)
+
+
+def make_session(cfg: Dict[str, str]) -> requests.Session:
+    """
+    Create a requests.Session that retries transient failures w/ exponential backoff.
+
+    We rely on urllib3.Retry (used internally by requests' HTTPAdapter) to:
+      * Retry on connection errors, read errors, and the status codes in RETRYABLE_STATUS.
+      * Honor `Retry-After` response headers automatically (RFC 7231).
+      * Apply exponential backoff: sleep = backoff_factor * (2 ** (retry_num - 1)).
+
+    We set allowed_methods=False so *all* HTTP verbs are eligible (MediaWiki uses POST for login).
+
+    NOTE: urllib3.Retry does **not** look at JSON bodies (e.g., Discord's `{"retry_after":…}`),
+    so we still handle that separately in discord_send().
+    """
+    retry = Retry(
+        total=int(cfg["http_total_retries"]),
+        read=int(cfg["http_total_retries"]),
+        connect=int(cfg["http_total_retries"]),
+        status=int(cfg["http_total_retries"]),
+        backoff_factor=float(cfg["http_backoff_factor"]),
+        status_forcelist=RETRYABLE_STATUS,
+        allowed_methods=False,  # retry on any method (GET/POST/...)
+        respect_retry_after_header=True,
+        raise_on_status=False,  # let caller inspect/raise
+    )
+
+    adapter = HTTPAdapter(max_retries=retry)
+    session = requests.Session()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+###############################################################################
+# Retry-After helpers (used for Discord JSON & logging)
+###############################################################################
+
+def _parse_retry_after(value: str) -> Optional[float]:
+    """Parse header Retry-After value into seconds (float)."""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(value)
+    except Exception:  # defensive
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    return max((dt - now).total_seconds(), 0.0)
+
+
+def _get_retry_after(resp) -> Optional[float]:
+    """
+    Extract retry-after seconds from a response.
+    Checks header first; falls back to JSON body field `retry_after` (Discord).
+    """
+    if resp is None:
+        return None
+    ra = resp.headers.get("Retry-After")
+    if ra is not None:
+        parsed = _parse_retry_after(ra)
+        if parsed is not None:
+            return parsed
+    try:
+        data = resp.json()
+        if isinstance(data, dict) and "retry_after" in data:
+            return float(data["retry_after"])
+    except Exception:
+        pass
+    return None
+
+
 def mw_login(session: requests.Session, cfg: Dict[str, str]) -> None:
     """Log in (or reuse existing cookies) with BotPassword; store cookies on disk."""
     cookies_file = Path(cfg["state_dir"]) / "cookies.lwp"
@@ -86,7 +185,11 @@ def mw_login(session: requests.Session, cfg: Dict[str, str]) -> None:
         pass
 
     # Check if we're already logged in
-    r = session.get(cfg["wiki_api"], params={"action": "query", "meta": "userinfo", "format": "json"})
+    r = session.get(
+        cfg["wiki_api"],
+        params={"action": "query", "meta": "userinfo", "format": "json"},
+        timeout=30,
+    )
     if r.ok and r.json().get("query", {}).get("userinfo", {}).get("id", 0) != 0:
         logging.info("Re-using existing session cookies.")
         return
@@ -95,7 +198,13 @@ def mw_login(session: requests.Session, cfg: Dict[str, str]) -> None:
     # Step 1: fetch login token
     token_r = session.get(
         cfg["wiki_api"],
-        params={"action": "query", "meta": "tokens", "type": "login", "format": "json"},
+        params={
+            "action": "query",
+            "meta": "tokens",
+            "type": "login",
+            "format": "json",
+        },
+        timeout=30,
     )
     token_r.raise_for_status()
     login_token = token_r.json()["query"]["tokens"]["logintoken"]
@@ -137,7 +246,6 @@ def fetch_recent_changes(session: requests.Session, cfg: Dict[str, str], last_rc
     while keep_fetching:
         if continue_token:
             params["rccontinue"] = continue_token
-
         r = session.get(cfg["wiki_api"], params=params, timeout=30)
         r.raise_for_status()
         data = r.json()
@@ -169,12 +277,12 @@ def fetch_latest_change(session: requests.Session, cfg: Dict[str, str]) -> Dict 
     r = session.get(
         cfg["wiki_api"],
         params={
-            "action": "query",
-            "list": "recentchanges",
-            "rcprop": "title|ids|comment|user|timestamp",
-            "rcdir": "older",    # newest first
-            "rclimit": "1",
-            "format": "json",
+                "action": "query",
+                "list": "recentchanges",
+                "rcprop": "title|ids|comment|user|timestamp",
+                "rcdir": "older",    # newest first
+                "rclimit": "1",
+                "format": "json",
         },
         timeout=30,
     )
@@ -184,8 +292,10 @@ def fetch_latest_change(session: requests.Session, cfg: Dict[str, str]) -> Dict 
 
 
 def discord_send(webhook: SyncWebhook, message: str, cfg: Dict[str, str]) -> None:
-    """Send a message with exponential back-off on HTTP 429."""
-    delay = cfg["initial_backoff"]
+    """
+    Send a message with exponential backoff & Retry-After honouring (Discord JSON aware).
+    """
+    delay = float(cfg["initial_backoff"])
     while True:
         try:
             webhook.send(message, username=cfg["discord_username"], avatar_url=(cfg["discord_avatar"] if cfg["discord_avatar"] else None), wait=False)
@@ -193,15 +303,20 @@ def discord_send(webhook: SyncWebhook, message: str, cfg: Dict[str, str]) -> Non
         except HTTPException as exc:
             if exc.status != 429:
                 raise
-            retry_after = (
-                exc.response.headers.get("Retry-After")
-                or exc.response.json().get("retry_after")
-                or delay
-            )
-            retry_after = float(retry_after)
+            # Parse Retry-After (header or JSON 'retry_after')
+            retry_after = _get_retry_after(exc.response)
+            if retry_after is None:
+                retry_after = delay
+                jitter = random.uniform(-retry_after * 0.1, retry_after * 0.1)
+                retry_after = max(0, retry_after + jitter)
+                # heuristic waits are capped
+                retry_after = min(retry_after, float(cfg["max_backoff"]))
             logging.warning("Discord rate-limited; retrying in %.1f s …", retry_after)
             time.sleep(retry_after)
-            delay = min(delay * 2, cfg["max_backoff"])
+            # grow for next heuristic retry
+            if retry_after == delay or retry_after < float(cfg["max_backoff"]):
+                delay = min(delay * 2, float(cfg["max_backoff"]))
+            continue
 
 
 def build_discord_message(rc: Dict, cfg: Dict[str, str]) -> str:
@@ -258,8 +373,8 @@ def main() -> None:
     state_dir.mkdir(parents=True, exist_ok=True)
     state_path = state_dir / "last_rcid.txt"
 
-    # HTTP session & login
-    session = requests.Session()
+    # HTTP session (with retries) & login
+    session = make_session(cfg)
     mw_login(session, cfg)
 
     # Discord webhook
