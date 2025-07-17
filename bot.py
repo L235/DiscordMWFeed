@@ -173,6 +173,60 @@ def _get_retry_after(resp) -> Optional[float]:
     return None
 
 
+###############################################################################
+# HTTP Request Logging
+###############################################################################
+
+def log_request(method: str, url: str, params: Optional[Dict] = None, data: Optional[Dict] = None, **kwargs) -> None:
+    """Log HTTP request details."""
+    log_msg = f"HTTP {method} {url}"
+    if params:
+        log_msg += f" params={params}"
+    if data:
+        # Don't log sensitive data like passwords
+        safe_data = {k: v for k, v in data.items() if 'pass' not in k.lower()}
+        log_msg += f" data={safe_data}"
+    logging.debug(log_msg)
+
+
+def log_response(response: requests.Response, start_time: float) -> None:
+    """Log HTTP response details including timing."""
+    duration = time.time() - start_time
+    status = response.status_code
+    size = len(response.content) if response.content else 0
+    
+    if status >= 400:
+        logging.warning(f"HTTP {status} {response.url} ({duration:.2f}s, {size} bytes)")
+        if status >= 500:
+            logging.error(f"Server error response: {response.text[:200]}...")
+    else:
+        logging.debug(f"HTTP {status} {response.url} ({duration:.2f}s, {size} bytes)")
+
+
+def make_logged_session(cfg: Dict[str, str]) -> requests.Session:
+    """Create a session with request/response logging."""
+    session = make_session(cfg)
+    
+    # Monkey patch the session's request method to add logging
+    original_request = session.request
+    
+    def logged_request(method, url, **kwargs):
+        start_time = time.time()
+        log_request(method, url, **kwargs)
+        
+        try:
+            response = original_request(method, url, **kwargs)
+            log_response(response, start_time)
+            return response
+        except Exception as e:
+            duration = time.time() - start_time
+            logging.error(f"HTTP request failed: {method} {url} ({duration:.2f}s) - {e}")
+            raise
+    
+    session.request = logged_request
+    return session
+
+
 def mw_login(session: requests.Session, cfg: Dict[str, str]) -> None:
     """Log in (or reuse existing cookies) with BotPassword; store cookies on disk."""
     cookies_file = Path(cfg["state_dir"]) / "cookies.lwp"
@@ -298,7 +352,9 @@ def discord_send(webhook: SyncWebhook, message: str, cfg: Dict[str, str]) -> Non
     delay = float(cfg["initial_backoff"])
     while True:
         try:
+            logging.debug(f"Sending Discord message: {message[:100]}...")
             webhook.send(message, username=cfg["discord_username"], avatar_url=(cfg["discord_avatar"] if cfg["discord_avatar"] else None), wait=False)
+            logging.debug("Discord message sent successfully")
             return
         except HTTPException as exc:
             if exc.status != 429:
@@ -335,11 +391,14 @@ def build_discord_message(rc: Dict, cfg: Dict[str, str]) -> str:
 
 def run_once(session: requests.Session, webhook: SyncWebhook, cfg: Dict[str, str], state_path: Path) -> None:
     last_rcid = load_state(state_path)
+    logging.info(f"Checking for changes since rcid={last_rcid}")
+    
     changes = fetch_recent_changes(session, cfg, last_rcid)
     if not changes:
         logging.info("No new changes.")
         return
 
+    logging.info(f"Found {len(changes)} new changes")
     for rc in changes:
         msg = build_discord_message(rc, cfg)
         discord_send(webhook, msg, cfg)
@@ -347,6 +406,7 @@ def run_once(session: requests.Session, webhook: SyncWebhook, cfg: Dict[str, str
         logging.info("Sent: %s", msg)
 
     save_state(state_path, last_rcid)
+    logging.info(f"Updated state to rcid={last_rcid}")
 
 
 def parse_args() -> Dict[str, str]:
@@ -354,27 +414,30 @@ def parse_args() -> Dict[str, str]:
     p.add_argument("--mode", choices=["continuous", "cron"], default=CONFIG["mode"])
     p.add_argument("--poll-interval", type=int, default=CONFIG["poll_interval"])
     p.add_argument("--state-dir", default=CONFIG["state_dir"])
+    p.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO", help="Set logging level")
     args = p.parse_args()
     return vars(args)
 
 
 def main() -> None:
+    cli_cfg = parse_args()
+    cfg = {**CONFIG, **cli_cfg}
+
+    # Configure logging
+    log_level = getattr(logging, cli_cfg["log_level"])
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-
-    cli_cfg = parse_args()
-    cfg = {**CONFIG, **cli_cfg}
 
     # Prepare state dir
     state_dir = Path(cfg["state_dir"]).expanduser()
     state_dir.mkdir(parents=True, exist_ok=True)
     state_path = state_dir / "last_rcid.txt"
 
-    # HTTP session (with retries) & login
-    session = make_session(cfg)
+    # HTTP session (with retries and logging) & login
+    session = make_logged_session(cfg)
     mw_login(session, cfg)
 
     # Discord webhook
